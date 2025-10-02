@@ -1,6 +1,7 @@
 import numpy as np
 import threading
 import time
+import os
 from enum import IntEnum
 
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize # dds
@@ -81,10 +82,11 @@ class G1_29_ArmController:
         self._gradual_time = None
 
         # initialize lowcmd publisher and lowstate subscriber
+        dds_interface = os.environ.get("XR_TELEOP_DDS_INTERFACE")
         if self.simulation_mode:
-            ChannelFactoryInitialize(1)
+            ChannelFactoryInitialize(1, dds_interface)
         else:
-            ChannelFactoryInitialize(0)
+            ChannelFactoryInitialize(0, dds_interface)
 
         if self.motion_mode:
             self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Motion, hg_LowCmd)

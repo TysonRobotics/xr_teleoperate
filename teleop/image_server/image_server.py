@@ -103,6 +103,15 @@ class OpenCVCamera():
 
 class ImageServer:
     def __init__(self, config, port = 5555, Unit_Test = False):
+
+        config = {
+            'fps': 30,
+            'head_camera_type': 'realsense',
+            'head_camera_image_shape': [480, 640],
+            'head_camera_id_numbers': ['243122074613'],
+            # Comment out wrist camera entries if you’re not using them
+        }
+
         """
         config example1:
         {

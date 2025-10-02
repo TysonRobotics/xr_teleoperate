@@ -1,181 +1,174 @@
-from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize # dds
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_, MotorStates_                           # idl
-from unitree_sdk2py.idl.default import unitree_go_msg_dds__MotorCmd_
+from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize  # dds
+from inspire_sdkpy import inspire_dds, inspire_hand_defaut
 
 from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
 import numpy as np
-from enum import IntEnum
 import threading
 import time
+import os
 from multiprocessing import Process, Array
 
 import logging_mp
 logger_mp = logging_mp.get_logger(__name__)
 
+inspire_tip_indices = [4, 9, 14, 19, 24]
 Inspire_Num_Motors = 6
-kTopicInspireCommand = "rt/inspire/cmd"
-kTopicInspireState = "rt/inspire/state"
+
+kTopicInspireCtrlLeft = "rt/inspire_hand/ctrl/l"
+kTopicInspireCtrlRight = "rt/inspire_hand/ctrl/r"
+kTopicInspireStateLeft = "rt/inspire_hand/state/l"
+kTopicInspireStateRight = "rt/inspire_hand/state/r"
+
 
 class Inspire_Controller:
-    def __init__(self, left_hand_array, right_hand_array, dual_hand_data_lock = None, dual_hand_state_array = None,
-                       dual_hand_action_array = None, fps = 100.0, Unit_Test = False, simulation_mode = False):
+    def __init__(self, left_hand_array, right_hand_array, dual_hand_data_lock=None, dual_hand_state_array=None,
+                 dual_hand_action_array=None, fps=100.0, Unit_Test=False, simulation_mode=False):
         logger_mp.info("Initialize Inspire_Controller...")
         self.fps = fps
         self.Unit_Test = Unit_Test
         self.simulation_mode = simulation_mode
+        self.dual_hand_data_lock = dual_hand_data_lock
+        self.dual_hand_state_array = dual_hand_state_array
+        self.dual_hand_action_array = dual_hand_action_array
+
         if not self.Unit_Test:
             self.hand_retargeting = HandRetargeting(HandType.INSPIRE_HAND)
         else:
             self.hand_retargeting = HandRetargeting(HandType.INSPIRE_HAND_Unit_Test)
 
+        dds_interface = os.environ.get("XR_TELEOP_DDS_INTERFACE")
         if self.simulation_mode:
-            ChannelFactoryInitialize(1)
+            ChannelFactoryInitialize(1, dds_interface)
         else:
-            ChannelFactoryInitialize(0)
+            ChannelFactoryInitialize(0, dds_interface)
 
-        # initialize handcmd publisher and handstate subscriber
-        self.HandCmb_publisher = ChannelPublisher(kTopicInspireCommand, MotorCmds_)
-        self.HandCmb_publisher.Init()
+        self.LeftHandCmd_publisher = ChannelPublisher(kTopicInspireCtrlLeft, inspire_dds.inspire_hand_ctrl)
+        self.LeftHandCmd_publisher.Init()
+        self.RightHandCmd_publisher = ChannelPublisher(kTopicInspireCtrlRight, inspire_dds.inspire_hand_ctrl)
+        self.RightHandCmd_publisher.Init()
 
-        self.HandState_subscriber = ChannelSubscriber(kTopicInspireState, MotorStates_)
-        self.HandState_subscriber.Init()
+        self.LeftHandState_subscriber = ChannelSubscriber(kTopicInspireStateLeft, inspire_dds.inspire_hand_state)
+        self.LeftHandState_subscriber.Init()
+        self.RightHandState_subscriber = ChannelSubscriber(kTopicInspireStateRight, inspire_dds.inspire_hand_state)
+        self.RightHandState_subscriber.Init()
 
-        # Shared Arrays for hand states
-        self.left_hand_state_array  = Array('d', Inspire_Num_Motors, lock=True)  
+        self.left_hand_state_array = Array('d', Inspire_Num_Motors, lock=True)
         self.right_hand_state_array = Array('d', Inspire_Num_Motors, lock=True)
 
-        # initialize subscribe thread
         self.subscribe_state_thread = threading.Thread(target=self._subscribe_hand_state)
         self.subscribe_state_thread.daemon = True
         self.subscribe_state_thread.start()
 
-        while True:
-            if any(self.right_hand_state_array): # any(self.left_hand_state_array) and 
-                break
+        wait_count = 0
+        while not (any(self.left_hand_state_array[:]) or any(self.right_hand_state_array[:])):
             time.sleep(0.01)
-            logger_mp.warning("[Inspire_Controller] Waiting to subscribe dds...")
-        logger_mp.info("[Inspire_Controller] Subscribe dds ok.")
+            wait_count += 1
+            if wait_count % 100 == 0:
+                logger_mp.warning("[Inspire_Controller] Waiting to subscribe to inspire hand state...")
+            if wait_count > 500:
+                logger_mp.warning("[Inspire_Controller] Timeout waiting for inspire hand state, continuing anyway.")
+                break
+        logger_mp.info("[Inspire_Controller] Hand state subscription ready.")
 
-        hand_control_process = Process(target=self.control_process, args=(left_hand_array, right_hand_array,  self.left_hand_state_array, self.right_hand_state_array,
-                                                                          dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array))
+        hand_control_process = Process(target=self.control_process,
+                                       args=(left_hand_array, right_hand_array,
+                                             self.left_hand_state_array, self.right_hand_state_array))
         hand_control_process.daemon = True
         hand_control_process.start()
 
         logger_mp.info("Initialize Inspire_Controller OK!\n")
 
     def _subscribe_hand_state(self):
+        logger_mp.info("[Inspire_Controller] State subscriber started.")
         while True:
-            hand_msg  = self.HandState_subscriber.Read()
-            if hand_msg is not None:
-                for idx, id in enumerate(Inspire_Left_Hand_JointIndex):
-                    self.left_hand_state_array[idx] = hand_msg.states[id].q
-                for idx, id in enumerate(Inspire_Right_Hand_JointIndex):
-                    self.right_hand_state_array[idx] = hand_msg.states[id].q
+            left_state_msg = self.LeftHandState_subscriber.Read()
+            if left_state_msg is not None and hasattr(left_state_msg, 'angle_act'):
+                with self.left_hand_state_array.get_lock():
+                    for i in range(min(Inspire_Num_Motors, len(left_state_msg.angle_act))):
+                        self.left_hand_state_array[i] = left_state_msg.angle_act[i] / 1000.0
+
+            right_state_msg = self.RightHandState_subscriber.Read()
+            if right_state_msg is not None and hasattr(right_state_msg, 'angle_act'):
+                with self.right_hand_state_array.get_lock():
+                    for i in range(min(Inspire_Num_Motors, len(right_state_msg.angle_act))):
+                        self.right_hand_state_array[i] = right_state_msg.angle_act[i] / 1000.0
+
             time.sleep(0.002)
 
-    def ctrl_dual_hand(self, left_q_target, right_q_target):
-        """
-        Set current left, right hand motor state target q
-        """
-        for idx, id in enumerate(Inspire_Left_Hand_JointIndex):             
-            self.hand_msg.cmds[id].q = left_q_target[idx]         
-        for idx, id in enumerate(Inspire_Right_Hand_JointIndex):             
-            self.hand_msg.cmds[id].q = right_q_target[idx] 
+    def _send_hand_command(self, left_angle_cmd_scaled, right_angle_cmd_scaled):
+        left_cmd_msg = inspire_hand_defaut.get_inspire_hand_ctrl()
+        left_cmd_msg.angle_set = left_angle_cmd_scaled
+        left_cmd_msg.mode = 0b0001
+        self.LeftHandCmd_publisher.Write(left_cmd_msg)
 
-        self.HandCmb_publisher.Write(self.hand_msg)
-        # logger_mp.debug("hand ctrl publish ok.")
-    
-    def control_process(self, left_hand_array, right_hand_array, left_hand_state_array, right_hand_state_array,
-                              dual_hand_data_lock = None, dual_hand_state_array = None, dual_hand_action_array = None):
-        self.running = True
+        right_cmd_msg = inspire_hand_defaut.get_inspire_hand_ctrl()
+        right_cmd_msg.angle_set = right_angle_cmd_scaled
+        right_cmd_msg.mode = 0b0001
+        self.RightHandCmd_publisher.Write(right_cmd_msg)
 
-        left_q_target  = np.full(Inspire_Num_Motors, 1.0)
-        right_q_target = np.full(Inspire_Num_Motors, 1.0)
-
-        # initialize inspire hand's cmd msg
-        self.hand_msg  = MotorCmds_()
-        self.hand_msg.cmds = [unitree_go_msg_dds__MotorCmd_() for _ in range(len(Inspire_Right_Hand_JointIndex) + len(Inspire_Left_Hand_JointIndex))]
-
-        for idx, id in enumerate(Inspire_Left_Hand_JointIndex):
-            self.hand_msg.cmds[id].q = 1.0
-        for idx, id in enumerate(Inspire_Right_Hand_JointIndex):
-            self.hand_msg.cmds[id].q = 1.0
+    def control_process(self, left_hand_array, right_hand_array, left_hand_state_array, right_hand_state_array):
+        logger_mp.info("[Inspire_Controller] Control process started.")
+        running = True
+        left_q_target_norm = np.ones(Inspire_Num_Motors)
+        right_q_target_norm = np.ones(Inspire_Num_Motors)
 
         try:
-            while self.running:
+            while running:
                 start_time = time.time()
-                # get dual hand state
+
                 with left_hand_array.get_lock():
-                    left_hand_data  = np.array(left_hand_array[:]).reshape(25, 3).copy()
+                    left_hand_data = np.array(left_hand_array[:]).reshape(25, 3).copy()
                 with right_hand_array.get_lock():
                     right_hand_data = np.array(right_hand_array[:]).reshape(25, 3).copy()
 
-                # Read left and right q_state from shared arrays
-                state_data = np.concatenate((np.array(left_hand_state_array[:]), np.array(right_hand_state_array[:])))
+                with left_hand_state_array.get_lock():
+                    left_state_norm = np.array(left_hand_state_array[:])
+                with right_hand_state_array.get_lock():
+                    right_state_norm = np.array(right_hand_state_array[:])
 
-                if not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])): # if hand data has been initialized.
-                    ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
-                    ref_right_value = right_hand_data[self.hand_retargeting.right_indices[1,:]] - right_hand_data[self.hand_retargeting.right_indices[0,:]]
+                state_data = np.concatenate((left_state_norm, right_state_norm))
 
-                    left_q_target  = self.hand_retargeting.left_retargeting.retarget(ref_left_value)[self.hand_retargeting.left_dex_retargeting_to_hardware]
-                    right_q_target = self.hand_retargeting.right_retargeting.retarget(ref_right_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
+                human_valid = not np.all(right_hand_data == 0.0) and not np.all(
+                    left_hand_data[4] == np.array([-1.13, 0.3, 0.15]))
 
-                    # In website https://support.unitree.com/home/en/G1_developer/inspire_dfx_dexterous_hand, you can find
-                    #     In the official document, the angles are in the range [0, 1] ==> 0.0: fully closed  1.0: fully open
-                    # The q_target now is in radians, ranges:
-                    #     - idx 0~3: 0~1.7 (1.7 = closed)
-                    #     - idx 4:   0~0.5
-                    #     - idx 5:  -0.1~1.3
-                    # We normalize them using (max - value) / range
+                if human_valid:
+                    ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1, :]] - \
+                        left_hand_data[self.hand_retargeting.left_indices[0, :]]
+                    ref_right_value = right_hand_data[self.hand_retargeting.right_indices[1, :]] - \
+                        right_hand_data[self.hand_retargeting.right_indices[0, :]]
+
+                    raw_left_q = self.hand_retargeting.left_retargeting.retarget(ref_left_value)[
+                        self.hand_retargeting.left_dex_retargeting_to_hardware]
+                    raw_right_q = self.hand_retargeting.right_retargeting.retarget(ref_right_value)[
+                        self.hand_retargeting.right_dex_retargeting_to_hardware]
+
                     def normalize(val, min_val, max_val):
                         return np.clip((max_val - val) / (max_val - min_val), 0.0, 1.0)
 
                     for idx in range(Inspire_Num_Motors):
                         if idx <= 3:
-                            left_q_target[idx]  = normalize(left_q_target[idx], 0.0, 1.7)
-                            right_q_target[idx] = normalize(right_q_target[idx], 0.0, 1.7)
+                            left_q_target_norm[idx] = normalize(raw_left_q[idx], 0.0, 1.7)
+                            right_q_target_norm[idx] = normalize(raw_right_q[idx], 0.0, 1.7)
                         elif idx == 4:
-                            left_q_target[idx]  = normalize(left_q_target[idx], 0.0, 0.5)
-                            right_q_target[idx] = normalize(right_q_target[idx], 0.0, 0.5)
-                        elif idx == 5:
-                            left_q_target[idx]  = normalize(left_q_target[idx], -0.1, 1.3)
-                            right_q_target[idx] = normalize(right_q_target[idx], -0.1, 1.3)
+                            left_q_target_norm[idx] = normalize(raw_left_q[idx], 0.0, 0.5)
+                            right_q_target_norm[idx] = normalize(raw_right_q[idx], 0.0, 0.5)
+                        else:
+                            left_q_target_norm[idx] = normalize(raw_left_q[idx], -0.1, 1.3)
+                            right_q_target_norm[idx] = normalize(raw_right_q[idx], -0.1, 1.3)
 
-                # get dual hand action
-                action_data = np.concatenate((left_q_target, right_q_target))    
-                if dual_hand_state_array and dual_hand_action_array:
-                    with dual_hand_data_lock:
-                        dual_hand_state_array[:] = state_data
-                        dual_hand_action_array[:] = action_data
+                scaled_left_cmd = [int(np.clip(val * 1000, 0, 1000)) for val in left_q_target_norm]
+                scaled_right_cmd = [int(np.clip(val * 1000, 0, 1000)) for val in right_q_target_norm]
 
-                self.ctrl_dual_hand(left_q_target, right_q_target)
+                if self.dual_hand_state_array is not None and self.dual_hand_action_array is not None and self.dual_hand_data_lock is not None:
+                    with self.dual_hand_data_lock:
+                        self.dual_hand_state_array[:] = state_data
+                        self.dual_hand_action_array[:] = np.concatenate((left_q_target_norm, right_q_target_norm))
+
+                self._send_hand_command(scaled_left_cmd, scaled_right_cmd)
+
                 current_time = time.time()
-                time_elapsed = current_time - start_time
-                sleep_time = max(0, (1 / self.fps) - time_elapsed)
-                time.sleep(sleep_time)
+                sleep_time = max(0, (1.0 / self.fps) - (current_time - start_time))
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
         finally:
-            logger_mp.info("Inspire_Controller has been closed.")
-
-# Update hand state, according to the official documentation, https://support.unitree.com/home/en/G1_developer/inspire_dfx_dexterous_hand
-# the state sequence is as shown in the table below
-# ┌──────┬───────┬──────┬────────┬────────┬────────────┬────────────────┬───────┬──────┬────────┬────────┬────────────┬────────────────┐
-# │ Id   │   0   │  1   │   2    │   3    │     4      │       5        │   6   │  7   │   8    │   9    │    10      │       11       │
-# ├──────┼───────┼──────┼────────┼────────┼────────────┼────────────────┼───────┼──────┼────────┼────────┼────────────┼────────────────┤
-# │      │                    Right Hand                                │                   Left Hand                                  │
-# │Joint │ pinky │ ring │ middle │ index  │ thumb-bend │ thumb-rotation │ pinky │ ring │ middle │ index  │ thumb-bend │ thumb-rotation │
-# └──────┴───────┴──────┴────────┴────────┴────────────┴────────────────┴───────┴──────┴────────┴────────┴────────────┴────────────────┘
-class Inspire_Right_Hand_JointIndex(IntEnum):
-    kRightHandPinky = 0
-    kRightHandRing = 1
-    kRightHandMiddle = 2
-    kRightHandIndex = 3
-    kRightHandThumbBend = 4
-    kRightHandThumbRotation = 5
-
-class Inspire_Left_Hand_JointIndex(IntEnum):
-    kLeftHandPinky = 6
-    kLeftHandRing = 7
-    kLeftHandMiddle = 8
-    kLeftHandIndex = 9
-    kLeftHandThumbBend = 10
-    kLeftHandThumbRotation = 11
+            logger_mp.info("Inspire_Controller control loop exited.")
